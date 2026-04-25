@@ -158,15 +158,22 @@ function cleanJsonHtml(jsonHtml: string): string {
         .replace(/\\u([\dA-Fa-f]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
-async function fetchWithRetry(url: string, retries = 2, delay = 1000): Promise<Response> {
+const DEFAULT_HEADERS: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "DNT": "1",
+    "Cookie": "__ddg1_=;__ddg2_=;",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+};
+
+async function fetchWithRetry(url: string, retries = 2, delay = 1000, extraHeaders?: Record<string, string>): Promise<Response> {
+    const headers = Object.assign({}, DEFAULT_HEADERS, extraHeaders || {});
     let lastError: Error | null = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
         try {
             const response = await fetch(url, {
                 method: "GET",
-                headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-                },
+                headers: headers,
             });
             if (response.ok) return response;
             lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -305,7 +312,7 @@ class Provider {
             try {
                 const encId = animekaiEncrypt(entry.id);
                 const viewUrl = `${this.api}/ajax/links/view?id=${entry.id}&_=${encId}`;
-                const viewResp: GenericResponse = await fetch(viewUrl).then(r => r.json());
+                const viewResp: GenericResponse = await fetchWithRetry(viewUrl, 1, 500, { "Referer": `${this.api}/` }).then(r => r.json());
                 if (viewResp.result) {
                     const decrypted = animekaiDecrypt(viewResp.result);
                     const parsed = JSON.parse(decrypted) as { url: string };
@@ -323,12 +330,11 @@ class Provider {
         if (!streamUrl) throw new Error("Unable to find a valid source");
 
         const mediaUrl = streamUrl.replace("/e/", "/media/");
-        const headers: Record<string, string> = {
+        const mediaHeaders: Record<string, string> = Object.assign({}, DEFAULT_HEADERS, {
             "Referer": `${this.api}/`,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-        };
+        });
 
-        const mediaResp = await fetch(mediaUrl, { headers });
+        const mediaResp = await fetch(mediaUrl, { headers: mediaHeaders });
         const mediaJson = await mediaResp.json();
         const encryptedResult = mediaJson?.result;
 
@@ -342,7 +348,7 @@ class Provider {
         if (!sources || sources.length === 0) throw new Error("No video sources found");
 
         const m3u8Link = sources[0].file;
-        const playlistResp = await fetch(m3u8Link, { headers });
+        const playlistResp = await fetchWithRetry(m3u8Link, 1, 500, { "Referer": `${this.api}/` });
         const playlistText = await playlistResp.text();
 
         const regex = /#EXT-X-STREAM-INF:BANDWIDTH=\d+,RESOLUTION=(\d+x\d+)\s*(.*)/g;
