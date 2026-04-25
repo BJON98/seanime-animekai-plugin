@@ -206,8 +206,34 @@ class Provider {
 
     async search(query: SearchOptions): Promise<SearchResult[]> {
         const normalizedQuery = this.normalizeQuery(query["query"]);
-        const url = `${this.api}/browser?keyword=${encodeURIComponent(normalizedQuery)}`;
 
+        // Try AJAX search first (more reliable), fall back to HTML page
+        try {
+            const ajaxUrl = `${this.api}/ajax/anime/search?keyword=${encodeURIComponent(normalizedQuery)}`;
+            const ajaxResp = await fetchWithRetry(ajaxUrl, 1, 500, { "X-Requested-With": "XMLHttpRequest" });
+            const ajaxJson: { status: string; result: { html: string } } = await ajaxResp.json();
+            if (ajaxJson.status === "ok" && ajaxJson.result?.html) {
+                const $ = LoadDoc(ajaxJson.result.html);
+                const animes: SearchResult[] = [];
+                $("a.aitem").each((_, elem) => {
+                    const href = elem.attr("href")?.slice(1) ?? "";
+                    const title = elem.find("h6.title").attr("data-jp") || elem.find("h6.title").text() || "";
+                    const subOrDub: SubOrDub = this.isSubOrDubOrBoth(elem);
+                    animes.push({
+                        id: `${href}?dub=${query["dub"]}`,
+                        url: `${this.api}/${href}`,
+                        title: title,
+                        subOrDub: subOrDub,
+                    });
+                });
+                return animes;
+            }
+        } catch (e: any) {
+            console.error("AJAX search failed, falling back to HTML:", e);
+        }
+
+        // Fallback: HTML page scraping
+        const url = `${this.api}/browser?keyword=${encodeURIComponent(normalizedQuery)}`;
         const data = await fetchWithRetry(url).then(r => r.text());
         const $ = LoadDoc(data);
         const animes: SearchResult[] = [];
