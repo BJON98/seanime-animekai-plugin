@@ -2,146 +2,81 @@
 /// <reference path="./core.d.ts"/>
 
 // ============================================================
-// AnimeKai Streaming Provider - Self-Contained v2.0
-// Implements encryption/decryption natively (from protozoa-cryptography)
-// No dependency on enc-dec.app
+// AnimeKai Streaming Provider v2.1
+// Uses enc-dec.app for crypto (current algorithm) with retry
+// Fixed domain, search, URL construction, error handling
 // ============================================================
 
-// --- Base64 URL-safe no-pad ---
+interface GenericResponse {
+    status: number | string;
+    result: string;
+}
 
-const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+interface EncDecResponse {
+    status: number;
+    result: string;
+}
 
-function b64Encode(input: string): string {
-    const bytes: number[] = [];
-    for (let i = 0; i < input.length; i++) bytes.push(input.charCodeAt(i) & 0xFF);
-    let out = "";
-    for (let i = 0; i < bytes.length; i += 3) {
-        const a = bytes[i];
-        const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
-        const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
-        const bits = (a << 16) | (b << 8) | c;
-        out += B64_CHARS[(bits >> 18) & 0x3F];
-        out += B64_CHARS[(bits >> 12) & 0x3F];
-        if (i + 1 < bytes.length) out += B64_CHARS[(bits >> 6) & 0x3F];
-        if (i + 2 < bytes.length) out += B64_CHARS[bits & 0x3F];
+const ENC_DEC_API = "https://enc-dec.app/api";
+
+// --- HTTP ---
+
+const DEFAULT_HEADERS: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "DNT": "1",
+    "Cookie": "__ddg1_=;__ddg2_=;",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+};
+
+async function fetchWithRetry(url: string, retries = 2, delay = 1000, extraHeaders?: Record<string, string>): Promise<Response> {
+    const headers = Object.assign({}, DEFAULT_HEADERS, extraHeaders || {});
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch(url, { method: "GET", headers: headers });
+            if (response.ok) return response;
+            lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
+        } catch (e: any) {
+            lastError = e;
+        }
+        if (attempt < retries && delay > 0) {
+            $sleep(delay);
+        }
     }
-    return out;
+    throw lastError || new Error("Fetch failed after retries");
 }
 
-function b64Decode(input: string): string {
-    const lookup: Record<string, number> = {};
-    for (let i = 0; i < B64_CHARS.length; i++) lookup[B64_CHARS[i]] = i;
-    const result: number[] = [];
-    let i = 0;
-    while (i < input.length) {
-        const a = lookup[input[i++]] ?? 0;
-        const b = lookup[input[i++]] ?? 0;
-        const c = i < input.length ? (lookup[input[i++]] ?? 0) : 0;
-        const d = i < input.length ? (lookup[input[i++]] ?? 0) : 0;
-        result.push((a << 2) | (b >> 4));
-        if (i - 2 < input.length) result.push(((b & 0xF) << 4) | (c >> 2));
-        if (i - 1 < input.length) result.push(((c & 0x3) << 6) | d);
-    }
-    let str = "";
-    for (let j = 0; j < result.length; j++) str += String.fromCharCode(result[j]);
-    return str;
+// --- enc-dec.app wrappers with retry ---
+
+async function encKai(text: string): Promise<string> {
+    const url = `${ENC_DEC_API}/enc-kai?text=${encodeURIComponent(text)}`;
+    const resp = await fetchWithRetry(url, 2, 1000);
+    const json: EncDecResponse = await resp.json();
+    if (json.status !== 200 || !json.result) throw new Error("enc-kai failed");
+    return json.result;
 }
 
-// --- RC4 cipher (UTF-16 code unit mode, matches protozoa-cryptography) ---
-
-function rc4(key: string, data: string): string {
-    const s: number[] = [];
-    for (let i = 0; i < 256; i++) s[i] = i;
-    let j = 0;
-    const keyCodes: number[] = [];
-    for (let i = 0; i < key.length; i++) keyCodes.push(key.charCodeAt(i));
-    for (let i = 0; i < 256; i++) {
-        j = (j + s[i] + keyCodes[i % keyCodes.length]) % 256;
-        const tmp = s[i]; s[i] = s[j]; s[j] = tmp;
-    }
-    let ii = 0; j = 0;
-    const res: number[] = [];
-    for (let k = 0; k < data.length; k++) {
-        ii = (ii + 1) % 256;
-        j = (j + s[ii]) % 256;
-        const tmp = s[ii]; s[ii] = s[j]; s[j] = tmp;
-        const kk = s[(s[ii] + s[j]) % 256];
-        res.push((data.charCodeAt(k) ^ kk) & 0xFF);
-    }
-    let out = "";
-    for (let i = 0; i < res.length; i++) out += String.fromCharCode(res[i]);
-    return out;
+async function decKai(text: string): Promise<string> {
+    const resp = await fetch(`${ENC_DEC_API}/dec-kai`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text }),
+    });
+    const json = await resp.json();
+    if (json.status !== 200 || !json.result) throw new Error("dec-kai failed");
+    return json.result;
 }
 
-// --- Helpers ---
-
-function reverseStr(s: string): string {
-    return s.split("").reverse().join("");
-}
-
-function charReplace(input: string, search: string, replace: string): string {
-    const map: Record<string, string> = {};
-    for (let i = 0; i < search.length; i++) map[search[i]] = replace[i] || search[i];
-    let out = "";
-    for (let i = 0; i < input.length; i++) out += map[input[i]] || input[i];
-    return out;
-}
-
-function safeUrlDecode(s: string): string {
-    try { return decodeURIComponent(s); } catch { return s; }
-}
-
-// --- AnimeKai encrypt (replaces enc-dec.app /api/enc-kai) ---
-
-function animekaiEncrypt(input: string): string {
-    const text = encodeURIComponent(input);
-    const a = rc4("0DU8ksIVlFcia2", text);
-    const b = b64Encode(a);
-    const c = reverseStr(b);
-    const d = charReplace(c, "1wctXeHqb2", "1tecHq2Xbw");
-    const e = charReplace(d, "48KbrZx1ml", "Km8Zb4lxr1");
-    const f = rc4("kOCJnByYmfI", e);
-    const g = b64Encode(f);
-    const h = rc4("sXmH96C4vhRrgi8", g);
-    const i = b64Encode(h);
-    const j = charReplace(i, "hTn79AMjduR5", "djn5uT7AMR9h");
-    return b64Encode(j);
-}
-
-// --- AnimeKai decrypt (replaces enc-dec.app /api/dec-kai) ---
-
-function animekaiDecrypt(input: string): string {
-    const a = b64Decode(input);
-    const b = charReplace(a, "djn5uT7AMR9h", "hTn79AMjduR5");
-    const c = b64Decode(b);
-    const d = rc4("sXmH96C4vhRrgi8", c);
-    const e = b64Decode(d);
-    const f = rc4("kOCJnByYmfI", e);
-    const g = charReplace(f, "Km8Zb4lxr1", "48KbrZx1ml");
-    const h = charReplace(g, "1tecHq2Xbw", "1wctXeHqb2");
-    const i = reverseStr(h);
-    const j = b64Decode(i);
-    const k = rc4("0DU8ksIVlFcia2", j);
-    return safeUrlDecode(k);
-}
-
-// --- MegaUp decrypt (replaces enc-dec.app /api/dec-mega) ---
-
-function megaupDecrypt(input: string): string {
-    const a = b64Decode(input);
-    const b = reverseStr(a);
-    const c = charReplace(b, "OdilCbZWmrtUeYg", "YirdmeZblOtgCWU");
-    const d = b64Decode(c);
-    const e = rc4("HCcYA9gQqxUD", d);
-    const f = charReplace(e, "K9lQq2SsnjkObe", "l9j2sSnekQOqKb");
-    const g = reverseStr(f);
-    const h = b64Decode(g);
-    const i = rc4("ENZqBfw54cgsJ", h);
-    const j = b64Decode(i);
-    const k = reverseStr(j);
-    const l = rc4("XvxVdt4eTSnCyG", k);
-    const m = charReplace(l, "nMW7qCTpe6SQhco", "nqce7WMQC6pSTho");
-    return safeUrlDecode(m);
+async function decMega(text: string, agent: string): Promise<string> {
+    const resp = await fetch(`${ENC_DEC_API}/dec-mega`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text, agent: agent }),
+    });
+    const json = await resp.json();
+    if (json.status !== 200 || !json.result) throw new Error("dec-mega failed");
+    return JSON.stringify(json.result);
 }
 
 // --- Utility ---
@@ -158,41 +93,7 @@ function cleanJsonHtml(jsonHtml: string): string {
         .replace(/\\u([\dA-Fa-f]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 }
 
-const DEFAULT_HEADERS: Record<string, string> = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-    "DNT": "1",
-    "Cookie": "__ddg1_=;__ddg2_=;",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-};
-
-async function fetchWithRetry(url: string, retries = 2, delay = 1000, extraHeaders?: Record<string, string>): Promise<Response> {
-    const headers = Object.assign({}, DEFAULT_HEADERS, extraHeaders || {});
-    let lastError: Error | null = null;
-    for (let attempt = 0; attempt <= retries; attempt++) {
-        try {
-            const response = await fetch(url, {
-                method: "GET",
-                headers: headers,
-            });
-            if (response.ok) return response;
-            lastError = new Error(`HTTP ${response.status}: ${response.statusText}`);
-        } catch (e: any) {
-            lastError = e;
-        }
-        if (attempt < retries && delay > 0) {
-            $sleep(delay);
-        }
-    }
-    throw lastError || new Error("Fetch failed after retries");
-}
-
 // --- Provider ---
-
-interface GenericResponse {
-    status: number | string;
-    result: string;
-}
 
 class Provider {
     private api: string = "{{baseUrl}}";
@@ -207,7 +108,7 @@ class Provider {
     async search(query: SearchOptions): Promise<SearchResult[]> {
         const normalizedQuery = this.normalizeQuery(query["query"]);
 
-        // Try AJAX search first (more reliable), fall back to HTML page
+        // Try AJAX search first (faster, returns JSON)
         try {
             const ajaxUrl = `${this.api}/ajax/anime/search?keyword=${encodeURIComponent(normalizedQuery)}`;
             const ajaxResp = await fetchWithRetry(ajaxUrl, 1, 500, { "X-Requested-With": "XMLHttpRequest" });
@@ -242,11 +143,9 @@ class Provider {
             const id = elem.find("a.poster").attr("href")?.slice(1) ?? "";
             const title = elem.find("a.title").attr("title") ?? "";
             const subOrDub: SubOrDub = this.isSubOrDubOrBoth(elem);
-            const animeUrl = `${this.api}/${id}`;
-
             animes.push({
                 id: `${id}?dub=${query["dub"]}`,
-                url: animeUrl,
+                url: `${this.api}/${id}`,
                 title: title,
                 subOrDub: subOrDub,
             });
@@ -264,7 +163,7 @@ class Provider {
         const aniId = idMatch ? idMatch[1] : null;
         if (!aniId) throw new Error("Anime ID not found in page");
 
-        const token = animekaiEncrypt(aniId);
+        const token = await encKai(aniId);
         const episodesUrl = `${this.api}/ajax/episodes/list?ani_id=${aniId}&_=${token}`;
 
         const ajaxResult: GenericResponse = await fetchWithRetry(episodesUrl).then(r => r.json());
@@ -280,9 +179,8 @@ class Provider {
         const episodes: EpisodeDetails[] = [];
         for (const item of episodeData) {
             try {
-                const epToken = animekaiEncrypt(item.data);
+                const epToken = await encKai(item.data);
                 const dubPart = id.split("?dub=")[1];
-                // FIX: &dub= instead of ?dub= (original plugin had this bug)
                 episodes.push({
                     id: item.data ?? "",
                     number: item.number,
@@ -336,11 +234,11 @@ class Provider {
         const decryptedUrls: Record<string, string> = {};
         for (const entry of streamEntries) {
             try {
-                const encId = animekaiEncrypt(entry.id);
+                const encId = await encKai(entry.id);
                 const viewUrl = `${this.api}/ajax/links/view?id=${entry.id}&_=${encId}`;
                 const viewResp: GenericResponse = await fetchWithRetry(viewUrl, 1, 500, { "Referer": `${this.api}/` }).then(r => r.json());
                 if (viewResp.result) {
-                    const decrypted = animekaiDecrypt(viewResp.result);
+                    const decrypted = await decKai(viewResp.result);
                     const parsed = JSON.parse(decrypted) as { url: string };
                     decryptedUrls[entry.type] = parsed.url;
                 }
@@ -366,7 +264,7 @@ class Provider {
 
         if (!encryptedResult) throw new Error("No encrypted result from media endpoint");
 
-        const decryptedMega = megaupDecrypt(encryptedResult);
+        const decryptedMega = await decMega(encryptedResult, DEFAULT_HEADERS["User-Agent"]);
         const parsed = JSON.parse(decryptedMega);
         const sources = parsed?.sources || parsed?.result?.sources || [];
         const tracks = parsed?.tracks || parsed?.result?.tracks || [];
@@ -417,7 +315,7 @@ class Provider {
             server: server,
             headers: {
                 "Access-Control-Allow-Origin": "*",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                "User-Agent": DEFAULT_HEADERS["User-Agent"],
             },
             videoSources: videoSources,
         };
