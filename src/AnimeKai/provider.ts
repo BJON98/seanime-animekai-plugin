@@ -57,26 +57,36 @@ async function encKai(text: string): Promise<string> {
     return json.result;
 }
 
-async function decKai(text: string): Promise<string> {
+async function encKai(text: string): Promise<string> {
+    const url = `${ENC_DEC_API}/enc-kai?text=${encodeURIComponent(text)}`;
+    const resp = await fetchWithRetry(url, 2, 1000);
+    const json: { status: number; result: string } = await resp.json();
+    if (json.status !== 200 || !json.result) throw new Error("enc-kai failed");
+    return json.result;
+}
+
+// dec-kai returns {status: 200, result: {url: "...", skip: {...}}}
+async function decKai(text: string): Promise<{ url: string; skip?: { intro: [number, number]; outro: [number, number] } }> {
     const resp = await fetch(`${ENC_DEC_API}/dec-kai`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: text }),
     });
-    const json = await resp.json();
+    const json: { status: number; result: { url: string; skip?: { intro: [number, number]; outro: [number, number] } } } = await resp.json();
     if (json.status !== 200 || !json.result) throw new Error("dec-kai failed");
     return json.result;
 }
 
-async function decMega(text: string, agent: string): Promise<string> {
+// dec-mega returns {status: 200, result: {sources: [...], tracks: [...], download: "..."}}
+async function decMega(text: string, agent: string): Promise<{ sources: { file: string }[]; tracks: { file: string; label: string; kind: string; default?: boolean }[]; download?: string }> {
     const resp = await fetch(`${ENC_DEC_API}/dec-mega`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text: text, agent: agent }),
     });
-    const json = await resp.json();
+    const json: { status: number; result: { sources: { file: string }[]; tracks: { file: string; label: string; kind: string; default?: boolean }[]; download?: string } } = await resp.json();
     if (json.status !== 200 || !json.result) throw new Error("dec-mega failed");
-    return JSON.stringify(json.result);
+    return json.result;
 }
 
 // --- Utility ---
@@ -239,8 +249,7 @@ class Provider {
                 const viewResp: GenericResponse = await fetchWithRetry(viewUrl, 1, 500, { "Referer": `${this.api}/` }).then(r => r.json());
                 if (viewResp.result) {
                     const decrypted = await decKai(viewResp.result);
-                    const parsed = JSON.parse(decrypted) as { url: string };
-                    decryptedUrls[entry.type] = parsed.url;
+                    decryptedUrls[entry.type] = decrypted.url;
                 }
             } catch (e: any) {
                 console.error(`Error fetching ${entry.type} stream:`, e);
@@ -264,10 +273,9 @@ class Provider {
 
         if (!encryptedResult) throw new Error("No encrypted result from media endpoint");
 
-        const decryptedMega = await decMega(encryptedResult, DEFAULT_HEADERS["User-Agent"]);
-        const parsed = JSON.parse(decryptedMega);
-        const sources = parsed?.sources || parsed?.result?.sources || [];
-        const tracks = parsed?.tracks || parsed?.result?.tracks || [];
+        const megaResult = await decMega(encryptedResult, DEFAULT_HEADERS["User-Agent"]);
+        const sources = megaResult.sources || [];
+        const tracks = megaResult.tracks || [];
 
         if (!sources || sources.length === 0) throw new Error("No video sources found");
 
